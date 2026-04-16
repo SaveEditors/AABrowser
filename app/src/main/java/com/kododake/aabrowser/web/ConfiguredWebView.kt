@@ -97,6 +97,57 @@ fun configureWebView(
         //setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
         webViewClient = object : WebViewClient() {
+            private val VIDEO_DETECTION_JS = """
+                (function() {
+                    let lastW = 0, lastH = 0;
+                    function report() {
+                        const v = document.querySelector('video');
+                        if (!v) {
+                            if (window.VideoAssistant) window.VideoAssistant.onVideoDetected(false);
+                            return;
+                        }
+                        if (window.VideoAssistant) window.VideoAssistant.onVideoDetected(true);
+                        const w = v.videoWidth;
+                        const h = v.videoHeight;
+                        if (w > 0 && h > 0 && (w !== lastW || h !== lastH)) {
+                            lastW = w; lastH = h;
+                            window.VideoAssistant.onVideoDimensions(w, h);
+                        }
+                        
+                        if (window.VideoAssistant && v.duration) {
+                            window.VideoAssistant.onVideoProgress(v.currentTime, v.duration);
+                        }
+
+                        if (!v._va) {
+                            const evs = ['loadedmetadata', 'resize', 'play', 'playing', 'canplay', 'timeupdate', 'webkitfullscreenchange', 'fullscreenchange'];
+                            evs.forEach(e => v.addEventListener(e, report));
+                            v._va = true;
+                        }
+                    }
+                    window.prepareForFullscreen = function() {
+                        const handler = function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const v = document.querySelector('video');
+                            if (v) {
+                                if (v.requestFullscreen) v.requestFullscreen();
+                                else if (v.webkitRequestFullscreen) v.webkitRequestFullscreen();
+                            }
+                            window.removeEventListener('click', handler, true);
+                            window.removeEventListener('touchstart', handler, true);
+                        };
+                        window.addEventListener('click', handler, true);
+                        window.addEventListener('touchstart', handler, true);
+                    };
+                    window.reportVideoAssistant = report;
+                    if (document.documentElement) {
+                        new MutationObserver(report).observe(document.documentElement, { childList: true, subtree: true });
+                    }
+                    setInterval(report, 1000);
+                    report();
+                })();
+            """.trimIndent()
+
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val uri = request.url
                 if (handleCleartextIfNeeded(view, uri, callbacks, onPageStart = false)) return true
@@ -131,6 +182,7 @@ fun configureWebView(
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 view.evaluateJavascript(SpeechRecognitionBridge.POLYFILL_JS, null)
+                view.evaluateJavascript(VIDEO_DETECTION_JS, null)
                 url?.let(callbacks.onUrlChange)
             }
 
@@ -330,8 +382,8 @@ fun WebView.releaseCompletely() {
 private fun WebView.applyUserAgent(profile: UserAgentProfile, desktop: Boolean) {
     setTag(R.id.webview_user_agent_profile_tag, profile.storageKey)
     settings.userAgentString = buildUserAgent(profile, desktop)
-    settings.useWideViewPort = desktop
-    settings.loadWithOverviewMode = desktop
+    settings.useWideViewPort = true
+    settings.loadWithOverviewMode = true
 }
 
 private fun WebView.applyPageDarkening(enabled: Boolean) {
@@ -347,7 +399,7 @@ private fun buildUserAgent(profile: UserAgentProfile, desktop: Boolean): String 
     }
 }
 
-private const val CHROME_VERSION = "144.0.0.0"
+private const val CHROME_VERSION = "146.0.0.0"
 private const val MOBILE_CHROME_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION} Mobile Safari/537.36"
 private const val WINDOWS_CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION} Safari/537.36"
 private const val SAFARI_MAC_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"

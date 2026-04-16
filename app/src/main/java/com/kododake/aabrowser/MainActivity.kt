@@ -12,6 +12,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -19,6 +20,7 @@ import android.os.Looper
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.ContextThemeWrapper
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -30,6 +32,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Toast
+import com.kododake.aabrowser.view.InterceptTouchFrameLayout
 import com.kododake.aabrowser.analytics.UmamiTracker
 import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -38,6 +41,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.ColorUtils
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.isVisible
@@ -58,6 +62,7 @@ import com.kododake.aabrowser.web.updateDesktopMode
 import com.kododake.aabrowser.web.updatePageDarkening
 import com.kododake.aabrowser.web.updateUserAgentProfile
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.color.DynamicColors
 import com.google.android.material.textview.MaterialTextView
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
@@ -82,14 +87,84 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private val autoHideMenuFab = Runnable {
         if (!::binding.isInitialized) return@Runnable
+        if (isShowingStartPage) return@Runnable
         if (BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) return@Runnable
-        binding.menuFab.hide()
+        binding.quickActionsContainer.animate()
+            .alpha(0f)
+            .setDuration(300)
+            .withLayer()
+            .withEndAction {
+                binding.quickActionsContainer.visibility = View.GONE
+            }
+            .start()
     }
+
+    private val autoHideFsControls = Runnable {
+        if (customView != null) {
+            binding.fullscreenVideoControls.animate()
+                .alpha(0f)
+                .translationY(100f)
+                .setDuration(500)
+                .withEndAction {
+                    binding.fullscreenVideoControls.visibility = View.GONE
+                }
+                .start()
+
+            if (!BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) {
+                binding.quickActionsContainer.animate()
+                    .alpha(0f)
+                    .translationX(-100f)
+                    .setDuration(500)
+                    .withEndAction {
+                        binding.quickActionsContainer.visibility = View.GONE
+                    }
+                    .start()
+            }
+        }
+    }
+
+    private fun resetFsControlsTimer() {
+        handler.removeCallbacks(autoHideFsControls)
+        
+        if (binding.fullscreenVideoControls.visibility != View.VISIBLE) {
+            binding.fullscreenVideoControls.alpha = 0f
+            binding.fullscreenVideoControls.translationY = 100f
+            binding.fullscreenVideoControls.visibility = View.VISIBLE
+        }
+        binding.fullscreenVideoControls.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .setDuration(300)
+            .start()
+
+        if (binding.quickActionsContainer.visibility != View.VISIBLE) {
+            binding.quickActionsContainer.alpha = 0f
+            binding.quickActionsContainer.translationX = -100f
+            binding.quickActionsContainer.visibility = View.VISIBLE
+        }
+        binding.quickActionsContainer.animate()
+            .alpha(1f)
+            .translationX(0f)
+            .setDuration(300)
+            .start()
+
+        handler.postDelayed(autoHideFsControls, 5000L)
+    }
+
     private val showMenuFabRunnable = Runnable {
         if (!::binding.isInitialized) return@Runnable
-        if (isInFullscreen() || binding.menuOverlay.isVisible) return@Runnable
-        binding.menuFab.show()
-        if (!BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) {
+        if (binding.menuOverlay.isVisible) return@Runnable
+        if (binding.quickActionsContainer.visibility != View.VISIBLE) {
+            binding.quickActionsContainer.alpha = 0f
+            binding.quickActionsContainer.visibility = View.VISIBLE
+        }
+        binding.quickActionsContainer.animate()
+            .alpha(1f)
+            .setDuration(150)
+            .withLayer()
+            .start()
+        if (!isShowingStartPage && !BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) {
+            handler.removeCallbacks(autoHideMenuFab)
             handler.postDelayed(autoHideMenuFab, MENU_BUTTON_AUTO_HIDE_DELAY_MS)
         }
     }
@@ -116,6 +191,14 @@ class MainActivity : AppCompatActivity() {
     private var shouldForceSessionRestore: Boolean = false
     private var isShowingStartPage: Boolean = false
     private var isSyncingAddressFields: Boolean = false
+    private var isStartPagePhotoOnlyMode: Boolean = false
+    private var currentVideoZoomScale: Float = 1.0f
+    private var isVideoCropActive: Boolean = false
+    private var detectedVideoWidth: Int = 0
+    private var detectedVideoHeight: Int = 0
+    private var loadedStartPageBackgroundUri: String? = null
+    private var loadedStartPageBackgroundBitmap: Bitmap? = null
+    private var cachedStartPageGradientSignature: Int = 0
 
     override fun attachBaseContext(newBase: Context?) {
         if (newBase == null) {
@@ -126,6 +209,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         AppCompatDelegate.setDefaultNightMode(BrowserPreferences.getThemeMode(this).nightMode)
         super.onCreate(savedInstanceState)
         shouldForceSessionRestore = savedInstanceState != null
@@ -157,6 +241,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         webView?.onResume()
+        applyMenuHeaderColors()
         refreshHomePageMode()
         refreshBookmarks()
         refreshTabs()
@@ -167,6 +252,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        handler.removeCallbacks(autoHideFsControls)
         exitFullscreen()
         webView?.onPause()
         super.onPause()
@@ -175,7 +261,11 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         handler.removeCallbacks(autoHideMenuFab)
         handler.removeCallbacks(showMenuFabRunnable)
+        handler.removeCallbacks(autoHideFsControls)
         exitFullscreen()
+        loadedStartPageBackgroundBitmap?.recycle()
+        loadedStartPageBackgroundBitmap = null
+        loadedStartPageBackgroundUri = null
         browserTabs.forEach { tab ->
             tab.speechBridge.destroy()
             tab.webView.releaseCompletely()
@@ -198,6 +288,47 @@ class MainActivity : AppCompatActivity() {
         val typedValue = TypedValue()
         theme.resolveAttribute(attrRes, typedValue, true)
         return typedValue.data
+    }
+    
+    private fun resolveReadableTextColor(
+        backgroundColor: Int,
+        preferredColor: Int,
+        fallbackColor: Int
+    ): Int {
+        val preferredContrast = ColorUtils.calculateContrast(preferredColor, backgroundColor)
+        val fallbackContrast = ColorUtils.calculateContrast(fallbackColor, backgroundColor)
+        return if (preferredContrast >= fallbackContrast) preferredColor else fallbackColor
+    }
+
+    private fun applyMenuHeaderColors() {
+        val headerBackground = resolveThemeColor(com.google.android.material.R.attr.colorSurfaceContainerLow)
+        val readableText = resolveReadableTextColor(
+            backgroundColor = headerBackground,
+            preferredColor = resolveThemeColor(com.google.android.material.R.attr.colorOnSurface),
+            fallbackColor = resolveThemeColor(com.google.android.material.R.attr.colorOnPrimaryContainer)
+        )
+        val readableTint = ColorStateList.valueOf(readableText)
+
+        binding.menuTitle.setTextColor(readableText)
+        binding.pageTitle.setTextColor(readableText)
+        binding.bookmarkManagerTitle.setTextColor(readableText)
+        binding.bookmarkManagerSubtitle.setTextColor(readableText)
+        binding.tabManagerTitle.setTextColor(readableText)
+        binding.tabManagerSubtitle.setTextColor(readableText)
+        binding.checkLatestViewTitle.setTextColor(readableText)
+        binding.checkLatestViewSubtitle.setTextColor(readableText)
+
+        binding.buttonClose.setTextColor(readableText)
+        binding.buttonClose.iconTint = readableTint
+        binding.buttonBookmarkManagerBack.setTextColor(readableText)
+        binding.buttonBookmarkManagerBack.iconTint = readableTint
+        binding.buttonBookmarkManagerBack.strokeColor = readableTint
+        binding.buttonTabManagerBack.setTextColor(readableText)
+        binding.buttonTabManagerBack.iconTint = readableTint
+        binding.buttonTabManagerBack.strokeColor = readableTint
+        binding.buttonCheckLatestBack.setTextColor(readableText)
+        binding.buttonCheckLatestBack.iconTint = readableTint
+        binding.buttonCheckLatestBack.strokeColor = readableTint
     }
 
     private fun ensureNotificationPermissionIfNeeded() {
@@ -475,7 +606,7 @@ class MainActivity : AppCompatActivity() {
         dialog.setCanceledOnTouchOutside(false)
         dialog.show()
         dialog.getButton(DialogInterface.BUTTON_NEUTRAL)?.setTextColor(
-            ContextCompat.getColor(this, android.R.color.holo_red_dark)
+            resolveThemeColor(androidx.appcompat.R.attr.colorError)
         )
     }
 
@@ -590,11 +721,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        tabView.addJavascriptInterface(VideoAssistantInterface(), "VideoAssistant")
         tabView.addJavascriptInterface(object {
             @android.webkit.JavascriptInterface
             fun openExternal(url: String) {
-                if (url.isNullOrBlank()) return
-                runOnUiThread { runCatching { openUriExternally(Uri.parse(url)) } }
+                runOnUiThread {
+                    val safeUri = sanitizeJsExternalUrl(tabView, url) ?: return@runOnUiThread
+                    openUriExternally(safeUri)
+                }
             }
         }, "Android")
 
@@ -635,6 +769,11 @@ class MainActivity : AppCompatActivity() {
                     if (!isShowingStartPage) {
                         updateConnectionSecurityIcon(url)
                     }
+                    if (currentVideoZoomScale != 1.0f) {
+                        resetNativeVideoScale()
+                    }
+                    detectedVideoWidth = 0
+                    detectedVideoHeight = 0
                     refreshStartPage()
                     refreshTabs()
                 }
@@ -658,6 +797,12 @@ class MainActivity : AppCompatActivity() {
                     SiteIconCache.cacheIcon(this, url, icon)
                     if (isShowingStartPage) {
                         refreshStartPage()
+                    }
+                    if (binding.bookmarkManagerRoot.isVisible) {
+                        refreshBookmarks()
+                    }
+                    if (binding.tabManagerRoot.isVisible) {
+                        refreshTabs()
                     }
                 }
             },
@@ -686,7 +831,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { enterFullscreen(view, callback) }
             },
             onExitFullscreen = {
-                runOnUiThread { exitFullscreen(true) }
+                runOnUiThread { exitFullscreen(false) }
             },
             onPermissionRequest = { request ->
                 runOnUiThread { handleWebPermissionRequest(request) }
@@ -740,6 +885,13 @@ class MainActivity : AppCompatActivity() {
 
         currentUrl = selectedTab.currentUrl
         currentPageTitle = selectedTab.currentTitle
+
+        if (binding.addressEdit.text?.toString() != selectedTab.currentUrl) {
+            binding.addressEdit.setText(selectedTab.currentUrl)
+            binding.addressEdit.setSelection(binding.addressEdit.text?.length ?: 0)
+        }
+        syncAddressFieldsFrom(binding.addressEdit)
+        updateAddressClearButtons()
 
         if (selectedTab.currentUrl.isBlank()) {
             showStartPage()
@@ -806,7 +958,6 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.menu_tabs)
         }
         binding.buttonTabs.text = tabsLabel
-        binding.buttonStartPageTabs.text = tabsLabel
 
         val canAddMoreTabs = browserTabs.size < BrowserPreferences.MAX_OPEN_TABS
         binding.buttonNewTab.isEnabled = canAddMoreTabs
@@ -834,17 +985,32 @@ class MainActivity : AppCompatActivity() {
 
         browserTabs.forEach { tab ->
             val isActive = tab.id == activeTabId
+            val cardBackgroundColor = resolveThemeColor(
+                if (isActive) {
+                    com.google.android.material.R.attr.colorPrimaryContainer
+                } else {
+                    com.google.android.material.R.attr.colorSurfaceContainer
+                }
+            )
+            val primaryTextColor = resolveReadableTextColor(
+                backgroundColor = cardBackgroundColor,
+                preferredColor = resolveThemeColor(
+                    if (isActive) {
+                        com.google.android.material.R.attr.colorOnPrimaryContainer
+                    } else {
+                        com.google.android.material.R.attr.colorOnSurface
+                    }
+                ),
+                fallbackColor = resolveThemeColor(com.google.android.material.R.attr.colorOnSurface)
+            )
+            val secondaryTextColor = resolveReadableTextColor(
+                backgroundColor = cardBackgroundColor,
+                preferredColor = resolveThemeColor(com.google.android.material.R.attr.colorOnSurfaceVariant),
+                fallbackColor = primaryTextColor
+            )
             val card = com.google.android.material.card.MaterialCardView(this).apply {
                 radius = 12 * density
-                setCardBackgroundColor(
-                    resolveThemeColor(
-                        if (isActive) {
-                            com.google.android.material.R.attr.colorPrimaryContainer
-                        } else {
-                            com.google.android.material.R.attr.colorSurfaceContainer
-                        }
-                    )
-                )
+                setCardBackgroundColor(cardBackgroundColor)
                 strokeWidth = (1 * density).toInt()
                 strokeColor = resolveThemeColor(com.google.android.material.R.attr.colorOutlineVariant)
                 setOnClickListener {
@@ -857,9 +1023,19 @@ class MainActivity : AppCompatActivity() {
                 gravity = android.view.Gravity.CENTER_VERTICAL
                 setPadding((12 * density).toInt(), (12 * density).toInt(), (8 * density).toInt(), (12 * density).toInt())
             }
+            row.addView(
+                createSiteIconBadge(
+                    url = tab.currentUrl.takeIf { isActiveWebsiteUrl(it) },
+                    sizeDp = 40f,
+                    cornerRadiusDp = 12f,
+                    paddingDp = 6f,
+                    backgroundColor = resolveThemeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
+                )
+            )
             val textContainer = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginStart = (12 * density).toInt()
                     marginEnd = (8 * density).toInt()
                 }
             }
@@ -867,7 +1043,7 @@ class MainActivity : AppCompatActivity() {
                 textContainer.addView(MaterialTextView(this).apply {
                     text = getString(R.string.tab_manager_active_badge)
                     setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_LabelMedium)
-                    setTextColor(resolveThemeColor(androidx.appcompat.R.attr.colorPrimary))
+                    setTextColor(primaryTextColor)
                 })
             }
             textContainer.addView(MaterialTextView(this).apply {
@@ -875,6 +1051,7 @@ class MainActivity : AppCompatActivity() {
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
                 setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodyLarge)
+                setTextColor(primaryTextColor)
             })
             textContainer.addView(MaterialTextView(this).apply {
                 text = if (tab.currentUrl.isBlank()) {
@@ -885,6 +1062,7 @@ class MainActivity : AppCompatActivity() {
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
                 setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodySmall)
+                setTextColor(secondaryTextColor)
                 alpha = 0.7f
             })
 
@@ -932,6 +1110,31 @@ class MainActivity : AppCompatActivity() {
         binding.menuScroll.visibility = View.VISIBLE
     }
 
+    inner class VideoAssistantInterface {
+        @android.webkit.JavascriptInterface
+        fun onVideoDetected(found: Boolean) {
+            handler.post {
+                binding.videoAssistantFab.visibility = View.GONE
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun onVideoDimensions(width: Int, height: Int) {
+            handler.post {
+                if (width > 0 && height > 0) {
+                    detectedVideoWidth = width
+                    detectedVideoHeight = height
+                    customView?.let { updateVideoCrop(it) }
+                }
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun onVideoProgress(currentTime: Double, duration: Double) {
+            // No longer using internal progress indicator
+        }
+    }
+
     private fun setupUi() {
         val intentUrl = extractBrowsableUrl(intent)
         val homePageUrl = BrowserPreferences.getHomePageUrl(this)
@@ -940,7 +1143,7 @@ class MainActivity : AppCompatActivity() {
         val resumeLastPageOnLaunch = BrowserPreferences.shouldResumeLastPageOnLaunch(this)
         currentUserAgentProfile = BrowserPreferences.getUserAgentProfile(this)
 
-        binding.menuFab.hide()
+        binding.quickActionsContainer.visibility = View.GONE
         initializeTabs(
             intentUrl = intentUrl,
             homePageUrl = homePageUrl,
@@ -970,10 +1173,12 @@ class MainActivity : AppCompatActivity() {
         syncAddressFieldsFrom(binding.addressEdit)
         updateAddressClearButtons()
 
-        binding.buttonReload.setOnClickListener {
-            webView?.reload()
-            hideMenuOverlay()
+        binding.videoAssistantFab.setOnClickListener {
+            webView?.evaluateJavascript("window.prepareForFullscreen && window.prepareForFullscreen()", null)
+            Toast.makeText(this, R.string.tap_video_to_fullscreen, Toast.LENGTH_SHORT).show()
         }
+
+        setupFullscreenVideoControls()
 
         binding.buttonBack.setOnClickListener {
             webView?.let { if (it.canGoBack()) it.goBack() }
@@ -987,13 +1192,10 @@ class MainActivity : AppCompatActivity() {
 
         val tonalIconColor = resolveThemeColor(com.google.android.material.R.attr.colorOnSecondaryContainer)
         val tonalColorStateList = android.content.res.ColorStateList.valueOf(tonalIconColor)
-        val primaryColor = resolveThemeColor(androidx.appcompat.R.attr.colorPrimary)
-        val primaryColorStateList = android.content.res.ColorStateList.valueOf(primaryColor)
-
         val navButtons = listOf(
             binding.buttonBack, binding.buttonReload, binding.buttonForward,
             binding.buttonBookmarks, binding.buttonSettings, binding.buttonTabs,
-            binding.buttonNewTab, binding.buttonExternalGithub
+            binding.buttonNewTab
         )
 
         navButtons.forEach { btn ->
@@ -1003,7 +1205,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.buttonExternal.setOnClickListener { showQrCodeView() }
-        binding.buttonExternalGithub.iconTint = primaryColorStateList
+        binding.buttonExternalGithub.iconTint = null
         binding.buttonExternalGithub.setOnClickListener { openUriExternally(Uri.parse(GITHUB_REPO_URL)) }
         binding.buttonBookmarks.setOnClickListener { showBookmarkManager() }
         binding.buttonTabs.setOnClickListener { showTabManager() }
@@ -1041,14 +1243,6 @@ class MainActivity : AppCompatActivity() {
             hideMenuOverlay()
         }
         binding.buttonSettings.setOnClickListener { showSettingsView() }
-        binding.buttonStartPageBookmarks.setOnClickListener {
-            showMenuOverlay()
-            showBookmarkManager()
-        }
-        binding.buttonStartPageTabs.setOnClickListener {
-            showMenuOverlay()
-            showTabManager()
-        }
         binding.buttonStartPageResume.setOnClickListener {
             val resumeUrl = BrowserPreferences.getLastVisitedUrl(this)
             if (resumeUrl.isNullOrBlank()) {
@@ -1057,11 +1251,80 @@ class MainActivity : AppCompatActivity() {
                 loadUrlFromIntent(resumeUrl)
             }
         }
+        binding.buttonStartPagePhotoOnly.setOnClickListener {
+            isStartPagePhotoOnlyMode = !isStartPagePhotoOnlyMode
+            applyStartPagePhotoOnlyMode()
+            if (isStartPagePhotoOnlyMode) {
+                Toast.makeText(this, R.string.start_page_photo_only_hint, Toast.LENGTH_SHORT).show()
+            }
+        }
+        binding.startPageRoot.setOnClickListener {
+            if (isStartPagePhotoOnlyMode) {
+                isStartPagePhotoOnlyMode = false
+                applyStartPagePhotoOnlyMode()
+            }
+        }
+
+        fun applyStartPageDonateTab(tabId: Int) {
+            when (tabId) {
+                R.id.startPageDonateTabCoffee -> {
+                    binding.startPageDonateAddress.text = START_PAGE_COFFEE_URL
+                    val qrBitmap = generateQrCode(START_PAGE_COFFEE_URL)
+                    if (qrBitmap != null) {
+                        binding.startPageDonateQrImage.setImageBitmap(qrBitmap)
+                    }
+                    binding.startPageDonateActionButton.text = getString(R.string.settings_donate_open_coffee)
+                    binding.startPageDonateActionButton.setIconResource(R.drawable.favorite_24px)
+                    binding.startPageDonateActionButton.iconTint = ColorStateList.valueOf(Color.parseColor("#FFDD00"))
+                    binding.startPageDonateActionButton.setOnClickListener {
+                        openUriExternally(Uri.parse(START_PAGE_COFFEE_URL))
+                    }
+                }
+                R.id.startPageDonateTabGithub -> {
+                    binding.startPageDonateAddress.text = START_PAGE_SPONSOR_URL
+                    val qrBitmap = generateQrCode(START_PAGE_SPONSOR_URL)
+                    if (qrBitmap != null) {
+                        binding.startPageDonateQrImage.setImageBitmap(qrBitmap)
+                    } else {
+                        binding.startPageDonateQrImage.setImageResource(R.drawable.ic_github)
+                    }
+                    binding.startPageDonateActionButton.text = getString(R.string.settings_donate_open_github_sponsors)
+                    binding.startPageDonateActionButton.setIconResource(R.drawable.favorite_24px)
+                    binding.startPageDonateActionButton.iconTint = ColorStateList.valueOf(Color.parseColor("#EC407A"))
+                    binding.startPageDonateActionButton.setOnClickListener {
+                        openUriExternally(Uri.parse(START_PAGE_SPONSOR_URL))
+                    }
+                }
+                R.id.startPageDonateTabBitcoin -> {
+                    binding.startPageDonateAddress.text = getString(R.string.donate_bitcoin_address_value)
+                    binding.startPageDonateQrImage.setImageResource(R.drawable.bitcoin_qr)
+                    binding.startPageDonateActionButton.text = getString(R.string.donate_copy)
+                    binding.startPageDonateActionButton.setIconResource(R.drawable.content_copy_24px)
+                    binding.startPageDonateActionButton.iconTint = ColorStateList.valueOf(
+                        resolveThemeColor(com.google.android.material.R.attr.colorOnSecondaryContainer)
+                    )
+                    binding.startPageDonateActionButton.setOnClickListener {
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Bitcoin Address", binding.startPageDonateAddress.text.toString()))
+                        Toast.makeText(this, R.string.donate_copied, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+
+        binding.startPageDonateTabGroup.check(R.id.startPageDonateTabCoffee)
+        applyStartPageDonateTab(R.id.startPageDonateTabCoffee)
+        binding.startPageDonateTabGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            applyStartPageDonateTab(checkedId)
+        }
 
         binding.persistentButtonMenu.setOnClickListener { showMenuOverlay() }
         binding.menuFab.setOnClickListener { handleQuickActionButtonPressed() }
+
         binding.buttonClose.setOnClickListener { hideMenuOverlay() }
         binding.menuOverlayScrim.setOnClickListener { hideMenuOverlay() }
+        applyMenuHeaderColors()
 
         setupManualDragLogic()
 
@@ -1157,9 +1420,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleQuickActionButtonPressed() {
-        when (BrowserPreferences.getQuickActionButtonMode(this)) {
-            QuickActionButtonMode.MENU -> showMenuOverlay()
-            QuickActionButtonMode.ADDRESS_BAR -> showMenuOverlay(focusAddressBar = true)
+        val mode = BrowserPreferences.getQuickActionButtonMode(this)
+        if (mode == QuickActionButtonMode.ADDRESS_BAR) {
+            focusMenuAddressBar()
+            showMenuOverlay()
+        } else {
+            showMenuOverlay()
         }
     }
 
@@ -1192,31 +1458,24 @@ class MainActivity : AppCompatActivity() {
     private fun applyQuickActionButtonPreferences() {
         if (!::binding.isInitialized) return
 
-        val mode = BrowserPreferences.getQuickActionButtonMode(this)
-        binding.menuFab.setImageResource(
-            if (mode == QuickActionButtonMode.ADDRESS_BAR) {
-                R.drawable.search_24px
-            } else {
-                android.R.drawable.ic_menu_more
-            }
-        )
-        binding.menuFab.contentDescription = getString(
-            if (mode == QuickActionButtonMode.ADDRESS_BAR) {
-                R.string.menu_open_address_bar
-            } else {
-                R.string.menu_open_description
-            }
-        )
-
         val density = resources.displayMetrics.density
         val margin = (16 * density).toInt()
         val position = BrowserPreferences.getQuickActionButtonPosition(this)
-        val layoutParams = binding.menuFab.layoutParams as CoordinatorLayout.LayoutParams
+        val layoutParams = binding.quickActionsContainer.layoutParams as CoordinatorLayout.LayoutParams
         layoutParams.gravity = when (position) {
             QuickActionButtonPosition.BOTTOM_LEFT -> android.view.Gravity.BOTTOM or android.view.Gravity.START
             QuickActionButtonPosition.BOTTOM_RIGHT -> android.view.Gravity.BOTTOM or android.view.Gravity.END
             QuickActionButtonPosition.TOP_LEFT -> android.view.Gravity.TOP or android.view.Gravity.START
             QuickActionButtonPosition.TOP_RIGHT -> android.view.Gravity.TOP or android.view.Gravity.END
+        }
+
+        // Adjust button order based on side
+        val isRight = position == QuickActionButtonPosition.BOTTOM_RIGHT || position == QuickActionButtonPosition.TOP_RIGHT
+        binding.quickActionsContainer.removeView(binding.menuFab)
+        if (isRight) {
+            binding.quickActionsContainer.addView(binding.menuFab)
+        } else {
+            binding.quickActionsContainer.addView(binding.menuFab, 0)
         }
 
         val topOffset = if (position == QuickActionButtonPosition.TOP_LEFT || position == QuickActionButtonPosition.TOP_RIGHT) {
@@ -1225,15 +1484,20 @@ class MainActivity : AppCompatActivity() {
             margin
         }
         layoutParams.setMargins(margin, topOffset, margin, margin)
-        binding.menuFab.layoutParams = layoutParams
+        binding.quickActionsContainer.layoutParams = layoutParams
 
-        if (BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) {
+        if (isShowingStartPage || BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) {
             handler.removeCallbacks(showMenuFabRunnable)
             handler.removeCallbacks(autoHideMenuFab)
-            if (!isInFullscreen() && !binding.menuOverlay.isVisible) {
-                binding.menuFab.show()
+            if (!binding.menuOverlay.isVisible) {
+                binding.quickActionsContainer.visibility = View.VISIBLE
+                binding.quickActionsContainer.alpha = 1f
             }
+        } else if (binding.quickActionsContainer.visibility == View.VISIBLE && !handler.hasCallbacks(autoHideMenuFab)) {
+            handler.postDelayed(autoHideMenuFab, MENU_BUTTON_AUTO_HIDE_DELAY_MS)
         }
+
+        updateQuickActionsIcon()
     }
 
     private fun focusMenuAddressBar() {
@@ -1416,8 +1680,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateProgress(progress: Int) {
-        binding.progressIndicator.visibility = if (progress in 1..99) View.VISIBLE else View.GONE
-        if (progress in 1..99) binding.progressIndicator.setProgressCompat(progress, true)
+        // No longer using internal progress indicator
     }
 
     private fun showMenuOverlay(focusAddressBar: Boolean = false) {
@@ -1439,7 +1702,7 @@ class MainActivity : AppCompatActivity() {
         }
         handler.removeCallbacks(showMenuFabRunnable)
         handler.removeCallbacks(autoHideMenuFab)
-        binding.menuFab.hide()
+        binding.quickActionsContainer.visibility = View.GONE
         refreshBookmarks()
         refreshTabs()
         refreshStartPage()
@@ -1467,12 +1730,14 @@ class MainActivity : AppCompatActivity() {
     private fun showMenuButtonTemporarily() {
         handler.removeCallbacks(showMenuFabRunnable)
         handler.removeCallbacks(autoHideMenuFab)
-        if (isInFullscreen() || binding.menuOverlay.isVisible) return
-        if (BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) {
-            binding.menuFab.show()
+        if (binding.menuOverlay.isVisible) return
+        if (isShowingStartPage || BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) {
+            binding.quickActionsContainer.visibility = View.VISIBLE
+            binding.quickActionsContainer.alpha = 1f
             return
         }
-        handler.postDelayed(showMenuFabRunnable, MENU_BUTTON_SHOW_DELAY_MS)
+        // Removed delay for better responsiveness on user interaction
+        showMenuFabRunnable.run()
     }
 
     private fun openUriExternally(uri: Uri) {
@@ -1481,6 +1746,17 @@ class MainActivity : AppCompatActivity() {
         }.onFailure {
             Toast.makeText(this, R.string.error_open_external, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun sanitizeJsExternalUrl(sourceWebView: android.webkit.WebView, rawUrl: String?): Uri? {
+        val currentPage = sourceWebView.url ?: return null
+        if (!currentPage.startsWith(ERROR_PAGE_ASSET_PREFIX)) return null
+
+        val candidate = rawUrl?.trim().takeUnless { it.isNullOrBlank() } ?: return null
+        val parsed = runCatching { Uri.parse(candidate) }.getOrNull() ?: return null
+        val scheme = parsed.scheme?.lowercase() ?: return null
+        if (scheme !in setOf("http", "https")) return null
+        return parsed
     }
 
     private fun showKeyboard(view: View) {
@@ -1506,31 +1782,172 @@ class MainActivity : AppCompatActivity() {
         customView = view
         customViewCallback = callback
         if (binding.menuOverlay.isVisible) hideMenuOverlay()
-        binding.menuFab.hide()
         binding.persistentAddressBarCard.visibility = View.GONE
         webView?.visibility = View.INVISIBLE
-        binding.fullscreenContainer.apply {
-            visibility = View.VISIBLE
-            removeAllViews()
-            addView(view, FrameLayout.LayoutParams(-1, -1))
-            bringToFront()
+        
+        binding.fullscreenContainer.visibility = View.VISIBLE
+        binding.fullscreenContainer.removeAllViews()
+
+        // Reset state for new video
+        isVideoCropActive = false
+        currentVideoZoomScale = 1.0f
+        
+        val wrapper = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            addView(view, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER
+            ))
         }
+        binding.fullscreenContainer.addView(wrapper)
+        binding.fullscreenContainer.bringToFront()
+        
+        (binding.fullscreenContainer as? InterceptTouchFrameLayout)?.onInterceptTouchListener = { event ->
+            resetFsControlsTimer()
+        }
+
+        binding.fullscreenVideoControls.visibility = View.VISIBLE
+        binding.fullscreenVideoControls.bringToFront()
+        binding.quickActionsContainer.bringToFront()
+        binding.videoAssistantFab.visibility = View.GONE
+
+        // Trigger scale reset and timer once the view is laid out
+        view.post {
+            resetNativeVideoScale()
+            resetFsControlsTimer()
+        }
+        
+        view.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(v: View?, left: Int, top: Int, right: Int, bottom: Int,
+                                        oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int) {
+                if (customView == view) {
+                    updateVideoCrop(view)
+                }
+            }
+        })
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowInsetsControllerCompat(window, binding.fullscreenContainer).hide(WindowInsetsCompat.Type.systemBars())
+        WindowInsetsControllerCompat(window, binding.fullscreenContainer).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
     }
 
     private fun exitFullscreen(fromWebChrome: Boolean = false) {
+        handler.removeCallbacks(autoHideFsControls)
         if (customView == null) return
-        binding.fullscreenContainer.apply { removeAllViews(); visibility = View.GONE }
+        binding.fullscreenContainer.apply {
+            (this as? InterceptTouchFrameLayout)?.onInterceptTouchListener = null
+            setOnClickListener(null)
+            removeAllViews()
+            visibility = View.GONE
+        }
+        binding.fullscreenVideoControls.visibility = View.GONE
         webView?.visibility = if (isShowingStartPage) View.INVISIBLE else View.VISIBLE
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowInsetsControllerCompat(window, binding.root).show(WindowInsetsCompat.Type.systemBars())
         val callback = customViewCallback
+        customView?.apply {
+            scaleX = 1f
+            scaleY = 1f
+            translationX = 0f
+            translationY = 0f
+        }
         customView = null
         customViewCallback = null
         if (!fromWebChrome) callback?.onCustomViewHidden()
         applyPersistentAddressBarPreference()
         showMenuButtonTemporarily()
+    }
+
+    private fun setupFullscreenVideoControls() {
+        binding.buttonFsZoomIn.setOnClickListener { 
+            applyNativeVideoScale(0.1f) 
+            resetFsControlsTimer()
+        }
+        binding.buttonFsZoomOut.setOnClickListener { 
+            applyNativeVideoScale(-0.1f) 
+            resetFsControlsTimer()
+        }
+        binding.buttonFsReset.setOnClickListener { 
+            resetNativeVideoScale() 
+            resetFsControlsTimer()
+        }
+        binding.buttonFsCrop.setOnClickListener { 
+            toggleNativeVideoCrop() 
+            resetFsControlsTimer()
+        }
+        binding.buttonFsExit.setOnClickListener { 
+            webView?.evaluateJavascript("document.webkitExitFullscreen?.() || document.exitFullscreen?.()", null)
+            exitFullscreen(false)
+        }
+    }
+
+    private fun applyNativeVideoScale(delta: Float) {
+        customView?.let { view ->
+            currentVideoZoomScale *= (1.0f + delta)
+            currentVideoZoomScale = currentVideoZoomScale.coerceIn(0.1f, 5.0f)
+            updateVideoCrop(view)
+        }
+    }
+
+    private fun resetNativeVideoScale() {
+        currentVideoZoomScale = 1.0f
+        isVideoCropActive = false
+        customView?.let { view ->
+            view.translationX = 0f
+            view.translationY = 0f
+            view.scaleX = 1.0f
+            view.scaleY = 1.0f
+            updateVideoCrop(view)
+        } ?: run {
+            binding.buttonFsCrop.setIconResource(R.drawable.crop_free_24px)
+        }
+    }
+
+    private fun toggleNativeVideoCrop() {
+        isVideoCropActive = !isVideoCropActive
+        customView?.let { updateVideoCrop(it) }
+    }
+
+    private fun updateVideoCrop(view: View) {
+        val containerWidth = binding.fullscreenContainer.width.toFloat()
+        val containerHeight = binding.fullscreenContainer.height.toFloat()
+        
+        if (containerWidth <= 0f || containerHeight <= 0f) {
+            return
+        }
+
+        val videoWidth = if (detectedVideoWidth > 0) detectedVideoWidth.toFloat() else view.width.toFloat()
+        val videoHeight = if (detectedVideoHeight > 0) detectedVideoHeight.toFloat() else view.height.toFloat()
+
+        if (videoWidth <= 0f || videoHeight <= 0f) {
+            view.scaleX = currentVideoZoomScale
+            view.scaleY = currentVideoZoomScale
+            return
+        }
+
+        val containerAspect = containerWidth / containerHeight
+        val videoAspect = videoWidth / videoHeight
+
+        val fillScale = if (videoAspect > containerAspect) {
+            // Video is wider than container (height-constrained)
+            containerHeight / (containerWidth / videoAspect)
+        } else {
+            // Video is taller than container (width-constrained)
+            containerWidth / (containerHeight * videoAspect)
+        }
+
+        val baseScale = if (isVideoCropActive) fillScale else 1.0f
+
+        view.scaleX = baseScale * currentVideoZoomScale
+        view.scaleY = baseScale * currentVideoZoomScale
+        
+        binding.buttonFsCrop.setIconResource(if (isVideoCropActive) R.drawable.ic_close else R.drawable.crop_free_24px)
     }
 
     private fun addBookmarkForCurrentPage() {
@@ -1677,6 +2094,15 @@ class MainActivity : AppCompatActivity() {
                 gravity = android.view.Gravity.CENTER_VERTICAL
                 setPadding((12 * density).toInt(), (12 * density).toInt(), (8 * density).toInt(), (12 * density).toInt())
             }
+            row.addView(
+                createSiteIconBadge(
+                    url = bookmark,
+                    sizeDp = 40f,
+                    cornerRadiusDp = 12f,
+                    paddingDp = 6f,
+                    backgroundColor = resolveThemeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
+                )
+            )
             val textContainer = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = (12 * density).toInt() }
@@ -1685,7 +2111,7 @@ class MainActivity : AppCompatActivity() {
                 text = getString(R.string.start_page_slot_number, (startPageSlot + 1).coerceAtLeast(1))
                 visibility = if (startPageSlot >= 0) View.VISIBLE else View.GONE
                 setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_LabelMedium)
-                setTextColor(resolveThemeColor(androidx.appcompat.R.attr.colorPrimary))
+                setTextColor(resolveThemeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
             })
             textContainer.addView(MaterialTextView(this).apply {
                 text = displayLabelForUrl(bookmark)
@@ -1828,6 +2254,59 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun resolveCachedSiteIcon(url: String?): Bitmap? {
+        val cachedIcon = SiteIconCache.getCachedIcon(this, url)
+        if (cachedIcon == null && !url.isNullOrBlank()) {
+            prefetchSiteIcon(url)
+        }
+        return cachedIcon
+    }
+
+    private fun createSiteIconBadge(
+        url: String?,
+        sizeDp: Float,
+        cornerRadiusDp: Float,
+        paddingDp: Float,
+        backgroundColor: Int,
+        showAddOnEmptyUrl: Boolean = false
+    ): View {
+        val density = resources.displayMetrics.density
+        val cachedIcon = resolveCachedSiteIcon(url)
+        return FrameLayout(this).apply {
+            val sizePx = (sizeDp * density).toInt()
+            layoutParams = LinearLayout.LayoutParams(sizePx, sizePx)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = cornerRadiusDp * density
+                setColor(backgroundColor)
+            }
+
+            addView(ImageView(this@MainActivity).apply {
+                layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                val paddingPx = (paddingDp * density).toInt()
+                setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
+                if (cachedIcon != null) {
+                    setImageBitmap(cachedIcon)
+                } else {
+                    setImageResource(R.drawable.public_24px)
+                }
+                visibility = if (showAddOnEmptyUrl && url.isNullOrBlank()) View.GONE else View.VISIBLE
+            })
+
+            if (showAddOnEmptyUrl) {
+                addView(MaterialTextView(this@MainActivity).apply {
+                    layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+                    gravity = android.view.Gravity.CENTER
+                    text = "+"
+                    setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_TitleMedium)
+                    setTextColor(resolveThemeColor(com.google.android.material.R.attr.colorOnSecondaryContainer))
+                    visibility = if (url.isNullOrBlank()) View.VISIBLE else View.GONE
+                })
+            }
+        }
+    }
+
     private fun isHomePageEnabled(): Boolean {
         return !BrowserPreferences.getHomePageUrl(this).isNullOrBlank()
     }
@@ -1874,12 +2353,14 @@ class MainActivity : AppCompatActivity() {
         }
         if (isInFullscreen()) exitFullscreen()
         isShowingStartPage = true
+        isStartPagePhotoOnlyMode = false
         binding.startPageRoot.visibility = View.VISIBLE
         webView?.visibility = View.INVISIBLE
         binding.pageTitle.text = getString(R.string.start_page_title)
         binding.addressEdit.setText("")
         updateConnectionSecurityIcon(null)
         refreshStartPage()
+        applyStartPagePhotoOnlyMode()
         updateNavigationButtons()
         showMenuButtonTemporarily()
     }
@@ -1887,6 +2368,8 @@ class MainActivity : AppCompatActivity() {
     private fun hideStartPage() {
         if (!isShowingStartPage && binding.startPageRoot.visibility != View.VISIBLE) return
         isShowingStartPage = false
+        isStartPagePhotoOnlyMode = false
+        applyStartPagePhotoOnlyMode()
         binding.startPageRoot.visibility = View.GONE
         webView?.visibility = View.VISIBLE
         binding.pageTitle.text = currentPageTitle.ifBlank {
@@ -1905,6 +2388,23 @@ class MainActivity : AppCompatActivity() {
         refreshBookmarks()
     }
 
+    private fun applyStartPagePhotoOnlyMode() {
+        if (!::binding.isInitialized) return
+        binding.startPageScroll.visibility = if (isStartPagePhotoOnlyMode) View.GONE else View.VISIBLE
+        binding.startPageDimOverlay.visibility = if (isStartPagePhotoOnlyMode) View.GONE else View.VISIBLE
+        binding.buttonStartPagePhotoOnly.text = getString(
+            if (isStartPagePhotoOnlyMode) R.string.start_page_show_ui else R.string.start_page_photo_only
+        )
+
+        if (isStartPagePhotoOnlyMode) {
+            handler.removeCallbacks(showMenuFabRunnable)
+            handler.removeCallbacks(autoHideMenuFab)
+            binding.quickActionsContainer.visibility = View.GONE
+        } else if (isShowingStartPage) {
+            showMenuButtonTemporarily()
+        }
+    }
+
     private fun refreshStartPage() {
         refreshStartPageQuickLinks()
         refreshStartPageBackground()
@@ -1912,18 +2412,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshStartPageBackground() {
+        applyDynamicStartPageGradientBackground()
         val backgroundUri = BrowserPreferences.getStartPageBackgroundUri(this)
         if (backgroundUri.isNullOrBlank()) {
+            loadedStartPageBackgroundBitmap?.recycle()
+            loadedStartPageBackgroundBitmap = null
+            loadedStartPageBackgroundUri = null
             binding.startPageBackgroundImage.setImageBitmap(null)
             binding.startPageBackgroundImage.visibility = View.GONE
             return
         }
 
-        val bitmap = runCatching {
-            contentResolver.openInputStream(Uri.parse(backgroundUri))?.use { input ->
-                BitmapFactory.decodeStream(input)
-            }
-        }.getOrNull()
+        if (backgroundUri == loadedStartPageBackgroundUri && loadedStartPageBackgroundBitmap != null) {
+            binding.startPageBackgroundImage.setImageBitmap(loadedStartPageBackgroundBitmap)
+            binding.startPageBackgroundImage.visibility = View.VISIBLE
+            return
+        }
+
+        val reqWidth = resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        val reqHeight = resources.displayMetrics.heightPixels.coerceAtLeast(1)
+
+        val bitmap = decodeSampledBitmapFromUri(Uri.parse(backgroundUri), reqWidth, reqHeight)
+
+        loadedStartPageBackgroundBitmap?.recycle()
+        loadedStartPageBackgroundBitmap = bitmap
+        loadedStartPageBackgroundUri = if (bitmap != null) backgroundUri else null
 
         if (bitmap != null) {
             binding.startPageBackgroundImage.setImageBitmap(bitmap)
@@ -1932,6 +2445,97 @@ class MainActivity : AppCompatActivity() {
             binding.startPageBackgroundImage.setImageBitmap(null)
             binding.startPageBackgroundImage.visibility = View.GONE
         }
+    }
+
+    private fun applyDynamicStartPageGradientBackground() {
+        val baseSurface = resolveThemeColor(com.google.android.material.R.attr.colorSurface)
+        val primaryContainer = resolveThemeColor(com.google.android.material.R.attr.colorPrimaryContainer)
+        val secondaryContainer = resolveThemeColor(com.google.android.material.R.attr.colorSecondaryContainer)
+        val tertiaryContainer = resolveThemeColor(com.google.android.material.R.attr.colorTertiaryContainer)
+
+        val signature = baseSurface xor primaryContainer xor secondaryContainer xor tertiaryContainer
+        if (cachedStartPageGradientSignature == signature) return
+
+        val linearStart = ColorUtils.blendARGB(baseSurface, secondaryContainer, 0.30f)
+        val linearMid = ColorUtils.blendARGB(baseSurface, tertiaryContainer, 0.28f)
+        val linearEnd = ColorUtils.blendARGB(baseSurface, primaryContainer, 0.30f)
+
+        val ribbonA = ColorUtils.blendARGB(primaryContainer, tertiaryContainer, 0.45f)
+        val ribbonB = ColorUtils.blendARGB(secondaryContainer, primaryContainer, 0.50f)
+        val ribbonC = ColorUtils.blendARGB(tertiaryContainer, secondaryContainer, 0.42f)
+
+        val baseLayer = GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,
+            intArrayOf(linearStart, linearMid, linearEnd)
+        ).apply {
+            gradientType = GradientDrawable.LINEAR_GRADIENT
+        }
+
+        val blobA = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            gradientRadius = resources.displayMetrics.density * 460f
+            setGradientCenter(0.18f, 0.22f)
+            colors = intArrayOf(ColorUtils.setAlphaComponent(ribbonA, 170), Color.TRANSPARENT)
+        }
+
+        val blobB = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            gradientRadius = resources.displayMetrics.density * 520f
+            setGradientCenter(0.78f, 0.30f)
+            colors = intArrayOf(ColorUtils.setAlphaComponent(ribbonB, 160), Color.TRANSPARENT)
+        }
+
+        val blobC = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            gradientRadius = resources.displayMetrics.density * 540f
+            setGradientCenter(0.55f, 0.82f)
+            colors = intArrayOf(ColorUtils.setAlphaComponent(ribbonC, 150), Color.TRANSPARENT)
+        }
+
+        binding.startPageRoot.background = LayerDrawable(arrayOf(baseLayer, blobA, blobB, blobC))
+        cachedStartPageGradientSignature = signature
+    }
+
+    private fun decodeSampledBitmapFromUri(uri: Uri, reqWidth: Int, reqHeight: Int): Bitmap? {
+        val boundsOptions = BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+
+        val hasBounds = runCatching {
+            contentResolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, boundsOptions)
+            }
+            boundsOptions.outWidth > 0 && boundsOptions.outHeight > 0
+        }.getOrDefault(false)
+
+        if (!hasBounds) return null
+
+        val sampleSize = calculateInSampleSize(boundsOptions.outWidth, boundsOptions.outHeight, reqWidth, reqHeight)
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
+
+        return runCatching {
+            contentResolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, decodeOptions)
+            }
+        }.getOrNull()
+    }
+
+    private fun calculateInSampleSize(srcWidth: Int, srcHeight: Int, reqWidth: Int, reqHeight: Int): Int {
+        var inSampleSize = 1
+        if (srcHeight > reqHeight || srcWidth > reqWidth) {
+            var halfHeight = srcHeight / 2
+            var halfWidth = srcWidth / 2
+            while ((halfHeight / inSampleSize) >= reqHeight && (halfWidth / inSampleSize) >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+        return inSampleSize.coerceAtLeast(1)
     }
 
     private fun refreshStartPageQuickLinks() {
@@ -1972,10 +2576,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun createStartPageSlotCard(slotIndex: Int, url: String?): View {
         val density = resources.displayMetrics.density
-        val cachedIcon = SiteIconCache.getCachedIcon(this, url)
-        if (cachedIcon == null && !url.isNullOrBlank()) {
-            prefetchSiteIcon(url)
-        }
         return com.google.android.material.card.MaterialCardView(this).apply {
             radius = 18 * density
             strokeWidth = (1 * density).toInt()
@@ -1997,49 +2597,22 @@ class MainActivity : AppCompatActivity() {
                 addView(LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = android.view.Gravity.CENTER_VERTICAL
-
-                    addView(FrameLayout(this@MainActivity).apply {
-                        val size = (48 * density).toInt()
-                        layoutParams = LinearLayout.LayoutParams(size, size)
-                        background = GradientDrawable().apply {
-                            shape = GradientDrawable.RECTANGLE
-                            cornerRadius = 14 * density
-                            setColor(
+                    addView(
+                        createSiteIconBadge(
+                            url = url,
+                            sizeDp = 48f,
+                            cornerRadiusDp = 14f,
+                            paddingDp = 8f,
+                            backgroundColor = resolveThemeColor(
                                 if (url.isNullOrBlank()) {
-                                    resolveThemeColor(com.google.android.material.R.attr.colorSecondaryContainer)
+                                    com.google.android.material.R.attr.colorSecondaryContainer
                                 } else {
-                                    resolveThemeColor(com.google.android.material.R.attr.colorPrimaryContainer)
+                                    com.google.android.material.R.attr.colorPrimaryContainer
                                 }
-                            )
-                        }
-
-                        addView(ImageView(this@MainActivity).apply {
-                            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
-                            scaleType = ImageView.ScaleType.CENTER_INSIDE
-                            setPadding((10 * density).toInt(), (10 * density).toInt(), (10 * density).toInt(), (10 * density).toInt())
-                            setImageBitmap(cachedIcon)
-                            visibility = if (cachedIcon != null) View.VISIBLE else View.GONE
-                        })
-
-                        addView(MaterialTextView(this@MainActivity).apply {
-                            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
-                            gravity = android.view.Gravity.CENTER
-                            text = if (url.isNullOrBlank()) {
-                                "+"
-                            } else {
-                                displayLabelForUrl(url).firstOrNull()?.uppercaseChar()?.toString() ?: "?"
-                            }
-                            setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_TitleMedium)
-                            setTextColor(
-                                if (url.isNullOrBlank()) {
-                                    resolveThemeColor(com.google.android.material.R.attr.colorOnSecondaryContainer)
-                                } else {
-                                    resolveThemeColor(com.google.android.material.R.attr.colorOnPrimaryContainer)
-                                }
-                            )
-                            visibility = if (cachedIcon == null) View.VISIBLE else View.GONE
-                        })
-                    })
+                            ),
+                            showAddOnEmptyUrl = true
+                        )
+                    )
 
                     addView(MaterialTextView(this@MainActivity).apply {
                         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
@@ -2237,6 +2810,16 @@ class MainActivity : AppCompatActivity() {
         binding.menuScroll.visibility = View.VISIBLE
     }
 
+    private fun resetAutoHideTimer() {
+        if (!::binding.isInitialized) return
+        if (isShowingStartPage || BrowserPreferences.isQuickActionButtonAlwaysVisible(this)) return
+        handler.removeCallbacks(autoHideMenuFab)
+        binding.quickActionsContainer.animate().cancel()
+        binding.quickActionsContainer.alpha = 1f
+        binding.quickActionsContainer.visibility = View.VISIBLE
+        handler.postDelayed(autoHideMenuFab, MENU_BUTTON_AUTO_HIDE_DELAY_MS)
+    }
+
     private fun generateQrCode(content: String): Bitmap? {
         return try {
             val bitMatrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, 512, 512)
@@ -2246,10 +2829,22 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) { null }
     }
 
+    private fun updateQuickActionsIcon() {
+        if (!::binding.isInitialized) return
+        val currentMode = BrowserPreferences.getQuickActionButtonMode(this)
+        if (currentMode == QuickActionButtonMode.ADDRESS_BAR) {
+            binding.menuFab.setIconResource(R.drawable.search_24px)
+        } else {
+            binding.menuFab.setIconResource(R.drawable.tab_group_24px)
+        }
+    }
+
     companion object {
         private const val MENU_BUTTON_AUTO_HIDE_DELAY_MS = 3000L
-        private const val MENU_BUTTON_SHOW_DELAY_MS = 500L
+        private const val ERROR_PAGE_ASSET_PREFIX = "file:///android_asset/error.html"
         private const val GITHUB_REPO_URL = "https://github.com/kododake/AABrowser"
+        private const val START_PAGE_SPONSOR_URL = "https://github.com/sponsors/kododake"
+        private const val START_PAGE_COFFEE_URL = "https://buymeacoffee.com/str8spir"
         private const val KEEP_ANDROID_OPEN_URL = "https://keepandroidopen.org"
         private const val FREE_DROID_WARN_SOLUTIONS_URL = "https://github.com/woheller69/FreeDroidWarn?tab=readme-ov-file#solutions"
         private const val FREE_DROID_WARN_VERSION_KEY = "versionCodeWarn"
